@@ -139,6 +139,7 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
     private var outputStream: OutputStream?
     public weak var delegate: WSStreamDelegate?
     let BUFFER_MAX = 4096
+    let WAITING_INTERVAL = 0.01
 	
 	public var enableSOCKSProxy = false
     
@@ -207,27 +208,36 @@ open class FoundationStream : NSObject, WSStream, StreamDelegate  {
         
         CFReadStreamSetDispatchQueue(inStream, FoundationStream.sharedWorkQueue)
         CFWriteStreamSetDispatchQueue(outStream, FoundationStream.sharedWorkQueue)
+
         inStream.open()
         outStream.open()
-        
-        var out = timeout// wait X seconds before giving up
-        FoundationStream.sharedWorkQueue.async { [weak self] in
-            while !outStream.hasSpaceAvailable {
-                usleep(100) // wait until the socket is ready
-                out -= 100
-                if out < 0 {
-                    completion(WSError(type: .writeTimeoutError, message: "Timed out waiting for the socket to be ready for a write", code: 0))
-                    return
-                } else if let error = outStream.streamError {
-                    completion(error)
-                    return // disconnectStream will be called.
-                } else if self == nil {
-                    completion(WSError(type: .closeError, message: "socket object has been dereferenced", code: 0))
-                    return
-                }
-            }
-            completion(nil) //success!
+
+        waitUntilSocketIsReady(outStream: outStream, timeout: timeout, completion: completion)
+    }
+
+    open func waitUntilSocketIsReady(outStream: OutputStream, timeout: TimeInterval, completion: @escaping ((Error?) -> Void)) {
+        if outStream !== outputStream {
+            completion(WSError(type: .closeError, message: "socket object has been dereferenced", code: 0))
+            return;
         }
+        if outStream.hasSpaceAvailable {
+            completion(nil) //success!
+            return;
+        }
+        if let error = outStream.streamError {
+            completion(error)
+            return; // disconnectStream will be called.
+        }
+        if timeout < 0 {
+            completion(WSError(type: .writeTimeoutError, message: "Timed out waiting for the socket to be ready for a write", code: 0))
+            return;
+        }
+        assert(WAITING_INTERVAL >= 0.0001, "Waiting interval too small!")
+        FoundationStream.sharedWorkQueue.asyncAfter(deadline: .now() + WAITING_INTERVAL, execute: { [weak self] in
+            if let s = self {
+                s.waitUntilSocketIsReady(outStream: outStream, timeout: timeout - s.WAITING_INTERVAL, completion: completion)
+            }
+        })
     }
     
     public func write(data: Data) -> Int {
@@ -658,9 +668,8 @@ open class WebSocket : NSObject, StreamDelegate, WebSocketClient, WSStreamDelega
                                        cipherSuites: self.enabledSSLCipherSuites)
         #endif
         certValidated = !useSSL
-        let timeout = request.timeoutInterval * 1_000_000
         stream.delegate = self
-        stream.connect(url: url, port: port, timeout: timeout, ssl: settings, completion: { [weak self] (error) in
+        stream.connect(url: url, port: port, timeout: request.timeoutInterval, ssl: settings, completion: { [weak self] (error) in
             guard let s = self else {return}
             if error != nil {
                 s.disconnectStream(error)
